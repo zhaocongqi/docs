@@ -7,13 +7,8 @@
 #   Step 2: Create a new release branch from master and set as stable
 #   Step 3: Prepare master for the next development version
 #
-# Usage:
-#   ./hack/release.sh <new_version>
-#   ./hack/release.sh --dry-run <new_version>
-#
-# Examples:
-#   ./hack/release.sh 1.16
-#   ./hack/release.sh --dry-run 1.16
+# The script is idempotent: already-completed steps are detected and skipped
+# automatically, so it is safe to re-run after a partial failure.
 
 set -euo pipefail
 
@@ -21,22 +16,38 @@ CI_FILE=".github/workflows/ci.yml"
 MKDOCS_FILE="mkdocs.yml"
 CONTACT_FILE="overrides/contact.md"
 NEXT_FILE="docs/reference/next.md"
+VERSIONS_URL="https://kubeovn.github.io/docs/versions.json"
+ORIGINAL_BRANCH=""
 
 usage() {
-    echo "Usage: $0 [--dry-run] <new_version>"
-    echo ""
-    echo "Arguments:"
-    echo "  new_version   Version to release, e.g., 1.16"
-    echo ""
-    echo "Options:"
-    echo "  --dry-run     Show what would be changed without making any modifications"
-    echo ""
-    echo "Examples:"
-    echo "  $0 1.16"
-    echo "  $0 --dry-run 1.16"
+    cat <<EOF
+Usage: $0 [options] <new_version>
+
+Release a new documentation version for Kube-OVN.
+
+Arguments:
+  new_version       Version to release, e.g., 1.16
+
+Options:
+  --dry-run         Show what would be changed without making any modifications
+  --from-step N     Start from step N (1, 2, or 3), skipping earlier steps
+  --verify          Check deployed site versions.json instead of releasing
+  -h, --help        Show this help message
+
+Examples:
+  $0 1.16                  # Full release
+  $0 --dry-run 1.16        # Preview changes
+  $0 --from-step 2 1.16    # Resume from step 2 after a partial failure
+  $0 --verify 1.16         # Verify deployment after release
+EOF
 }
 
+# ---------------------------------------------------------------------------
+# Parse arguments
+# ---------------------------------------------------------------------------
 DRY_RUN=false
+VERIFY_ONLY=false
+FROM_STEP=0
 NEW_VER=""
 
 while [[ $# -gt 0 ]]; do
@@ -45,9 +56,26 @@ while [[ $# -gt 0 ]]; do
             DRY_RUN=true
             shift
             ;;
+        --from-step)
+            FROM_STEP="$2"
+            if ! [[ "$FROM_STEP" =~ ^[123]$ ]]; then
+                echo "ERROR: --from-step must be 1, 2, or 3"
+                exit 1
+            fi
+            shift 2
+            ;;
+        --verify)
+            VERIFY_ONLY=true
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
+            ;;
+        -*)
+            echo "ERROR: unknown option '$1'"
+            usage
+            exit 1
             ;;
         *)
             if [ -n "$NEW_VER" ]; then
@@ -81,6 +109,66 @@ NEXT_MINOR=$((NEW_MINOR + 1))
 PREV_VER="1.${PREV_MINOR}"
 NEXT_VER="1.${NEXT_MINOR}"
 
+# ---------------------------------------------------------------------------
+# Verify deployment (--verify mode)
+# ---------------------------------------------------------------------------
+if $VERIFY_ONLY; then
+    echo "Checking deployed versions at ${VERSIONS_URL} ..."
+    echo ""
+
+    if ! command -v curl &>/dev/null; then
+        echo "ERROR: curl is required for --verify"
+        exit 1
+    fi
+
+    versions_json=$(curl -sf "$VERSIONS_URL") || {
+        echo "ERROR: failed to fetch ${VERSIONS_URL}"
+        exit 1
+    }
+
+    errors=0
+
+    # Check v{NEW_VER}.x has stable+current aliases
+    if echo "$versions_json" | grep -q "\"v${NEW_VER}.x\"" &&
+       echo "$versions_json" | grep -q '"stable"' &&
+       echo "$versions_json" | grep -q "v${NEW_VER}.x (stable)"; then
+        echo "  v${NEW_VER}.x  stable, current  OK"
+    else
+        echo "  v${NEW_VER}.x  MISSING or not stable"
+        errors=$((errors + 1))
+    fi
+
+    # Check v{NEXT_VER}.x has dev alias
+    if echo "$versions_json" | grep -q "v${NEXT_VER}.x (dev)"; then
+        echo "  v${NEXT_VER}.x  dev              OK"
+    else
+        echo "  v${NEXT_VER}.x  MISSING or not dev"
+        errors=$((errors + 1))
+    fi
+
+    # Check v{PREV_VER}.x has no aliases
+    # Extract the entry for PREV_VER and check it doesn't have "stable" in its aliases
+    if echo "$versions_json" | grep -q "\"v${PREV_VER}.x\""; then
+        echo "  v${PREV_VER}.x  present          OK"
+    else
+        echo "  v${PREV_VER}.x  MISSING"
+        errors=$((errors + 1))
+    fi
+
+    echo ""
+    if [ $errors -eq 0 ]; then
+        echo "Verification passed."
+    else
+        echo "Verification failed with $errors error(s)."
+        echo "CI may still be running — wait a few minutes and retry."
+        exit 1
+    fi
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Banner
+# ---------------------------------------------------------------------------
 echo "========================================"
 echo "  Kube-OVN Docs Release"
 echo "========================================"
@@ -95,49 +183,131 @@ if $DRY_RUN; then
 fi
 
 # ---------------------------------------------------------------------------
-# Pre-checks
+# Helpers
+# ---------------------------------------------------------------------------
+
+# grep wrapper: always use -- to prevent patterns starting with - from being
+# interpreted as flags.
+grep_safe() {
+    grep -q -- "$@"
+}
+
+verify_content() {
+    local file="$1"
+    local pattern="$2"
+    local description="$3"
+
+    if ! grep_safe "$pattern" "$file"; then
+        echo "VERIFY FAILED: expected '$description' in $file"
+        echo "  pattern: $pattern"
+        echo ""
+        echo "The file may have an unexpected format. Please check manually."
+        exit 1
+    fi
+}
+
+# Return to the original branch on exit (success or failure)
+cleanup() {
+    if [ -n "$ORIGINAL_BRANCH" ]; then
+        git checkout "$ORIGINAL_BRANCH" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
+# Show recovery hint on error
+on_error() {
+    local step="$1"
+    echo ""
+    echo "========================================"
+    echo "  Step $step FAILED"
+    echo "========================================"
+    echo ""
+    case $step in
+        1)
+            echo "Recovery: the v${PREV_VER} branch may have partial changes."
+            echo "  git checkout v${PREV_VER} && git reset --hard origin/v${PREV_VER}"
+            echo ""
+            echo "Then re-run:  $0 ${NEW_VER}"
+            ;;
+        2)
+            echo "Recovery: delete the local v${NEW_VER} branch and re-run."
+            echo "  git checkout master && git branch -D v${NEW_VER}"
+            echo ""
+            echo "Then re-run:  $0 ${NEW_VER}"
+            echo "(Step 1 will be detected as complete and skipped automatically.)"
+            ;;
+        3)
+            echo "Recovery: reset master to match remote."
+            echo "  git checkout master && git reset --hard origin/master"
+            echo ""
+            echo "Then re-run:  $0 ${NEW_VER}"
+            echo "(Steps 1-2 will be detected as complete and skipped automatically.)"
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Detect which steps are already completed
+# ---------------------------------------------------------------------------
+detect_completed_steps() {
+    STEP1_DONE=false
+    STEP2_DONE=false
+    STEP3_DONE=false
+
+    git fetch origin
+
+    # Step 1: Is v{PREV_VER} already demoted? (no "current stable" in its CI)
+    if git ls-remote --exit-code --heads origin "v${PREV_VER}" >/dev/null 2>&1; then
+        local prev_ci
+        prev_ci=$(git show "origin/v${PREV_VER}:${CI_FILE}" 2>/dev/null) || true
+        if [ -n "$prev_ci" ] && ! echo "$prev_ci" | grep_safe "current stable"; then
+            STEP1_DONE=true
+        fi
+    fi
+
+    # Step 2: Does v{NEW_VER} branch already exist on remote?
+    if git ls-remote --exit-code --heads origin "v${NEW_VER}" >/dev/null 2>&1; then
+        STEP2_DONE=true
+    fi
+
+    # Step 3: Does master CI already deploy v{NEXT_VER}.x dev?
+    if grep_safe "mike deploy --push -u v${NEXT_VER}\.x dev" "$CI_FILE"; then
+        STEP3_DONE=true
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Pre-flight checks
 # ---------------------------------------------------------------------------
 preflight_check() {
     local errors=0
 
     # Must be on master
-    local current_branch
-    current_branch=$(git branch --show-current)
-    if [ "$current_branch" != "master" ]; then
-        echo "ERROR: Must be on master branch (currently on: $current_branch)"
+    ORIGINAL_BRANCH=$(git branch --show-current)
+    if [ "$ORIGINAL_BRANCH" != "master" ]; then
+        echo "ERROR: Must be on master branch (currently on: $ORIGINAL_BRANCH)"
         errors=$((errors + 1))
     fi
 
-    # Working directory must be clean
-    if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
-        echo "ERROR: Working directory is not clean. Please commit or stash changes first."
-        errors=$((errors + 1))
+    # Working directory must be clean (skip check for dry-run)
+    if ! $DRY_RUN; then
+        if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+            echo "ERROR: Working directory is not clean. Please commit or stash changes first."
+            errors=$((errors + 1))
+        fi
     fi
 
-    # Fetch latest
-    git fetch origin
-
-    # Master must be up to date
-    if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/master)" ]; then
-        echo "ERROR: Local master is not up to date with origin/master. Run 'git pull' first."
-        errors=$((errors + 1))
+    # Master must be up to date (skip check for dry-run)
+    if ! $DRY_RUN; then
+        if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/master)" ]; then
+            echo "ERROR: Local master is not up to date with origin/master. Run 'git pull' first."
+            errors=$((errors + 1))
+        fi
     fi
 
     # Previous stable branch must exist
     if ! git ls-remote --exit-code --heads origin "v${PREV_VER}" >/dev/null 2>&1; then
         echo "ERROR: Previous stable branch v${PREV_VER} does not exist on remote."
-        errors=$((errors + 1))
-    fi
-
-    # New branch must not exist yet
-    if git ls-remote --exit-code --heads origin "v${NEW_VER}" >/dev/null 2>&1; then
-        echo "ERROR: Branch v${NEW_VER} already exists on remote. Release may have been partially done."
-        errors=$((errors + 1))
-    fi
-
-    # Master CI must have the expected dev deployment
-    if ! grep -q "mike deploy --push -u v${NEW_VER}\.x dev" "$CI_FILE"; then
-        echo "ERROR: Master CI does not deploy v${NEW_VER}.x dev. Is master correctly configured?"
         errors=$((errors + 1))
     fi
 
@@ -147,30 +317,65 @@ preflight_check() {
         exit 1
     fi
 
-    echo "Pre-flight checks passed."
-}
+    # Detect completed steps
+    detect_completed_steps
 
-# ---------------------------------------------------------------------------
-# Verify that a file contains expected content after modification
-# ---------------------------------------------------------------------------
-verify_content() {
-    local file="$1"
-    local pattern="$2"
-    local description="$3"
-
-    if ! grep -q -- "$pattern" "$file"; then
-        echo "VERIFY FAILED: expected '$description' in $file"
-        echo "  pattern: $pattern"
+    if $STEP1_DONE || $STEP2_DONE || $STEP3_DONE; then
+        echo "Detected completed steps:"
+        $STEP1_DONE && echo "  Step 1: v${PREV_VER} already demoted"
+        $STEP2_DONE && echo "  Step 2: v${NEW_VER} branch already exists"
+        $STEP3_DONE && echo "  Step 3: master already targets v${NEXT_VER}"
         echo ""
-        echo "The file may have an unexpected format. Please check manually."
-        exit 1
     fi
+
+    # Apply --from-step override
+    if [ "$FROM_STEP" -gt 1 ]; then
+        STEP1_DONE=true
+    fi
+    if [ "$FROM_STEP" -gt 2 ]; then
+        STEP2_DONE=true
+    fi
+
+    # Validate that remaining steps can proceed
+    if ! $STEP1_DONE; then
+        # Step 1 needs "current stable" in prev branch CI
+        local prev_ci
+        prev_ci=$(git show "origin/v${PREV_VER}:${CI_FILE}" 2>/dev/null) || true
+        if [ -n "$prev_ci" ] && ! echo "$prev_ci" | grep_safe "current stable"; then
+            echo "WARNING: v${PREV_VER} CI has no 'current stable' to remove. Step 1 will be skipped."
+            STEP1_DONE=true
+        fi
+    fi
+
+    if ! $STEP2_DONE && ! $STEP3_DONE; then
+        # Step 2 needs master CI to have v{NEW_VER}.x dev
+        if ! grep_safe "mike deploy --push -u v${NEW_VER}\.x dev" "$CI_FILE"; then
+            echo "ERROR: Master CI does not deploy v${NEW_VER}.x dev. Is master correctly configured?"
+            exit 1
+        fi
+    fi
+
+    # Check if everything is already done
+    if $STEP1_DONE && $STEP2_DONE && $STEP3_DONE; then
+        echo "All steps are already complete. Nothing to do."
+        echo ""
+        echo "Run '$0 --verify ${NEW_VER}' to check the deployed site."
+        exit 0
+    fi
+
+    echo "Pre-flight checks passed."
 }
 
 # ---------------------------------------------------------------------------
 # Step 1: Demote previous stable branch
 # ---------------------------------------------------------------------------
 step1_demote_previous() {
+    if $STEP1_DONE; then
+        echo ""
+        echo "  Step 1/3: SKIP (v${PREV_VER} already demoted)"
+        return
+    fi
+
     echo ""
     echo "========================================"
     echo "  Step 1/3: Demote v${PREV_VER} from stable"
@@ -184,7 +389,7 @@ step1_demote_previous() {
     echo ""
 
     if $DRY_RUN; then
-        echo "  [DRY RUN] Skipping actual changes."
+        echo "  [DRY RUN] Skipping."
         return
     fi
 
@@ -210,7 +415,6 @@ step1_demote_previous() {
         "mike deploy --push -u v${PREV_VER}\.x -t \"v${PREV_VER}\.x\"" \
         "v${PREV_VER} non-stable deployment"
 
-    # There should be no more "current stable" or "set-default" in the file
     if grep -q "current stable" "$CI_FILE"; then
         echo "VERIFY FAILED: 'current stable' still present in ${CI_FILE}"
         exit 1
@@ -225,13 +429,19 @@ step1_demote_previous() {
     git push origin "v${PREV_VER}"
 
     echo ""
-    echo "  Done: v${PREV_VER} demoted from stable."
+    echo "  Done: v${PREV_VER} demoted."
 }
 
 # ---------------------------------------------------------------------------
 # Step 2: Create new release branch, set as stable
 # ---------------------------------------------------------------------------
 step2_create_stable() {
+    if $STEP2_DONE; then
+        echo ""
+        echo "  Step 2/3: SKIP (v${NEW_VER} branch already exists)"
+        return
+    fi
+
     echo ""
     echo "========================================"
     echo "  Step 2/3: Create v${NEW_VER} as stable"
@@ -241,17 +451,17 @@ step2_create_stable() {
     echo "  Changes :"
     echo "    ${CI_FILE}:"
     echo "      - Add v${NEW_VER} to trigger branches"
-    echo "      - Change mike deploy from 'dev' to 'current stable'"
-    echo "      - Add 'mike set-default stable'"
+    echo "      - Change mike deploy: dev -> current stable"
+    echo "      - Add mike set-default stable"
     echo "    ${MKDOCS_FILE}:"
-    echo "      - branch: release-${PREV_VER} -> release-${NEW_VER}"
-    echo "      - cover_subtitle: v${NEW_VER}.0"
+    echo "      - branch -> release-${NEW_VER}"
+    echo "      - cover_subtitle -> v${NEW_VER}.0"
     echo "    ${CONTACT_FILE}:"
-    echo "      - PDF link: v${PREV_VER}.x -> v${NEW_VER}.x"
+    echo "      - PDF link -> v${NEW_VER}.x"
     echo ""
 
     if $DRY_RUN; then
-        echo "  [DRY RUN] Skipping actual changes."
+        echo "  [DRY RUN] Skipping."
         return
     fi
 
@@ -260,32 +470,27 @@ step2_create_stable() {
 
     # --- ci.yml ---
 
-    # Verify master CI has the expected dev deployment
     verify_content "$CI_FILE" \
         "mike deploy --push -u v${NEW_VER}\.x dev -t \"v${NEW_VER}\.x (dev)\"" \
         "v${NEW_VER} dev deployment"
 
-    # Add branch trigger: insert "      - v{NEW_VER}" after "      - master"
+    # Add branch trigger after "      - master"
     sed -i "/^      - master$/a\\      - v${NEW_VER}" "$CI_FILE"
 
-    # Change mike deploy from dev to current stable
-    #   Before: mike deploy --push -u v1.16.x dev -t "v1.16.x (dev)"
-    #   After:  mike deploy --push -u v1.16.x current stable -t "v1.16.x (stable)"
+    # Change mike deploy: dev -> current stable
     sed -i \
         "s|mike deploy --push -u v${NEW_VER}\.x dev -t \"v${NEW_VER}\.x (dev)\"|mike deploy --push -u v${NEW_VER}.x current stable -t \"v${NEW_VER}.x (stable)\"|" \
         "$CI_FILE"
 
-    # Add "mike set-default stable --push" after the mike deploy line
+    # Add mike set-default after deploy line
     sed -i "/mike deploy --push -u v${NEW_VER}\.x current stable/a\\          mike set-default stable --push" "$CI_FILE"
 
     # Verify
-    verify_content "$CI_FILE" "- v${NEW_VER}$" "v${NEW_VER} branch trigger"
     verify_content "$CI_FILE" \
         "mike deploy --push -u v${NEW_VER}\.x current stable -t \"v${NEW_VER}\.x (stable)\"" \
         "v${NEW_VER} stable deployment"
     verify_content "$CI_FILE" "mike set-default stable --push" "mike set-default"
 
-    # Verify no leftover "dev" alias in the mike deploy line
     if grep "mike deploy" "$CI_FILE" | grep -q " dev "; then
         echo "VERIFY FAILED: 'dev' alias still present in mike deploy command"
         exit 1
@@ -293,10 +498,7 @@ step2_create_stable() {
 
     # --- mkdocs.yml ---
 
-    # Update branch variable
     sed -i "s|branch: release-${PREV_VER}|branch: release-${NEW_VER}|" "$MKDOCS_FILE"
-
-    # Update cover_subtitle to new version
     sed -i "s|cover_subtitle: v.*|cover_subtitle: v${NEW_VER}.0|" "$MKDOCS_FILE"
 
     verify_content "$MKDOCS_FILE" "branch: release-${NEW_VER}" "branch variable"
@@ -304,7 +506,6 @@ step2_create_stable() {
 
     # --- contact.md ---
 
-    # Update PDF link version
     sed -i "s|/docs/v[0-9]*\.[0-9]*\.x/|/docs/v${NEW_VER}.x/|g" "$CONTACT_FILE"
 
     verify_content "$CONTACT_FILE" "/docs/v${NEW_VER}\.x/" "PDF link version"
@@ -322,6 +523,12 @@ step2_create_stable() {
 # Step 3: Prepare master for the next development version
 # ---------------------------------------------------------------------------
 step3_prepare_next() {
+    if $STEP3_DONE; then
+        echo ""
+        echo "  Step 3/3: SKIP (master already targets v${NEXT_VER})"
+        return
+    fi
+
     echo ""
     echo "========================================"
     echo "  Step 3/3: Prepare master for v${NEXT_VER}"
@@ -332,17 +539,17 @@ step3_prepare_next() {
     echo "    ${CI_FILE}:"
     echo "      - mike deploy: v${NEW_VER}.x dev -> v${NEXT_VER}.x dev"
     echo "    ${MKDOCS_FILE}:"
-    echo "      - version: v${NEW_VER}.0 -> v${NEXT_VER}.0"
-    echo "      - branch: release-${PREV_VER} -> release-${NEW_VER}"
-    echo "      - cover_subtitle: v${NEXT_VER}.0"
+    echo "      - version -> v${NEXT_VER}.0"
+    echo "      - branch -> release-${NEW_VER}"
+    echo "      - cover_subtitle -> v${NEXT_VER}.0"
     echo "    ${CONTACT_FILE}:"
-    echo "      - PDF link: -> v${NEW_VER}.x (points to new stable)"
+    echo "      - PDF link -> v${NEW_VER}.x (points to new stable)"
     echo "    ${NEXT_FILE}:"
     echo "      - Add 'Post-v${NEW_VER}.0' section heading"
     echo ""
 
     if $DRY_RUN; then
-        echo "  [DRY RUN] Skipping actual changes."
+        echo "  [DRY RUN] Skipping."
         return
     fi
 
@@ -350,9 +557,6 @@ step3_prepare_next() {
 
     # --- ci.yml ---
 
-    # Change mike deploy version
-    #   Before: mike deploy --push -u v1.16.x dev -t "v1.16.x (dev)"
-    #   After:  mike deploy --push -u v1.17.x dev -t "v1.17.x (dev)"
     sed -i \
         "s|mike deploy --push -u v${NEW_VER}\.x dev -t \"v${NEW_VER}\.x (dev)\"|mike deploy --push -u v${NEXT_VER}.x dev -t \"v${NEXT_VER}.x (dev)\"|" \
         "$CI_FILE"
@@ -363,13 +567,8 @@ step3_prepare_next() {
 
     # --- mkdocs.yml ---
 
-    # Update version
     sed -i "s|version: v${NEW_VER}\.0|version: v${NEXT_VER}.0|" "$MKDOCS_FILE"
-
-    # Update branch
     sed -i "s|branch: release-${PREV_VER}|branch: release-${NEW_VER}|" "$MKDOCS_FILE"
-
-    # Update cover_subtitle
     sed -i "s|cover_subtitle: v.*|cover_subtitle: v${NEXT_VER}.0|" "$MKDOCS_FILE"
 
     verify_content "$MKDOCS_FILE" "version: v${NEXT_VER}\.0" "version variable"
@@ -378,17 +577,16 @@ step3_prepare_next() {
 
     # --- contact.md ---
 
-    # Update PDF link to point to the new stable version
     sed -i "s|/docs/v[0-9]*\.[0-9]*\.x/|/docs/v${NEW_VER}.x/|g" "$CONTACT_FILE"
 
     verify_content "$CONTACT_FILE" "/docs/v${NEW_VER}\.x/" "PDF link version"
 
     # --- next.md ---
 
-    # Insert new "Post-v{NEW_VER}.0" section heading after the description line
-    sed -i "/^This document lists the features/a\\\n## Post-v${NEW_VER}.0" "$NEXT_FILE"
-
-    verify_content "$NEXT_FILE" "## Post-v${NEW_VER}\.0" "new Post section heading"
+    if ! grep_safe "## Post-v${NEW_VER}\.0" "$NEXT_FILE"; then
+        sed -i "/^This document lists the features/a\\\n## Post-v${NEW_VER}.0" "$NEXT_FILE"
+        verify_content "$NEXT_FILE" "## Post-v${NEW_VER}\.0" "new Post section heading"
+    fi
 
     # --- Commit and push ---
     git add "$CI_FILE" "$MKDOCS_FILE" "$CONTACT_FILE" "$NEXT_FILE"
@@ -414,9 +612,26 @@ if ! $DRY_RUN; then
     fi
 fi
 
+# Run step 1 with error trap
+if ! $STEP1_DONE && ! $DRY_RUN; then
+    trap 'on_error 1' ERR
+fi
 step1_demote_previous
+
+# Run step 2 with error trap
+if ! $STEP2_DONE && ! $DRY_RUN; then
+    trap 'on_error 2' ERR
+fi
 step2_create_stable
+
+# Run step 3 with error trap
+if ! $STEP3_DONE && ! $DRY_RUN; then
+    trap 'on_error 3' ERR
+fi
 step3_prepare_next
+
+# Clear the error trap
+trap cleanup EXIT
 
 echo ""
 echo "========================================"
@@ -428,11 +643,12 @@ echo "  v${PREV_VER} branch  : demoted (no longer stable)"
 echo "  v${NEW_VER} branch  : created and set as stable"
 echo "  master branch : prepared for v${NEXT_VER} development"
 echo ""
-echo "CI will now:"
-echo "  - Deploy v${PREV_VER} docs as 'v${PREV_VER}.x'"
-echo "  - Deploy v${NEW_VER} docs as 'v${NEW_VER}.x (stable)' [default]"
-echo "  - Deploy master docs as 'v${NEXT_VER}.x (dev)'"
+echo "NOTE: Each push triggers a CI job that deploys to gh-pages."
+echo "These jobs may conflict if they run concurrently."
+echo "If a CI job fails with a push conflict, re-run it from"
+echo "GitHub Actions — the retry will succeed once the other"
+echo "jobs finish."
 echo ""
-
-# Return to master
-git checkout master
+echo "Verify the deployment (after CI completes):"
+echo "  $0 --verify ${NEW_VER}"
+echo ""
