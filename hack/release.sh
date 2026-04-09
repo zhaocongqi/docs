@@ -158,7 +158,7 @@ verify_content() {
     local pattern="$2"
     local description="$3"
 
-    if ! grep -q "$pattern" "$file"; then
+    if ! grep -q -- "$pattern" "$file"; then
         echo "VERIFY FAILED: expected '$description' in $file"
         echo "  pattern: $pattern"
         echo ""
